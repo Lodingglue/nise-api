@@ -10,9 +10,6 @@
 #include <vector>
 #include <functional>
 
-// ============================================================
-//  GamePwange helper libraries (compiled into fakelib)
-// ============================================================
 extern "C" {
 #include "mem.h"        // writeMemory / readMemory primitives
 #include "proc.h"       // proc_map type and /proc/self/maps helpers
@@ -41,321 +38,9 @@ struct FMOD_CREATESOUNDEXINFO;
 extern uintptr_t mclib_baseaddr;
 
 
-// ============================================================
-//  HookPriority
-// ============================================================
-
-/**
- * @brief Priority level for hook slot ownership.
- *
- * When two callers try to hook the same address or name, the one with the
- * higher priority wins. A lower-priority request is rejected by
- * HookManager::canHookWithPriority() if a higher-priority hook already owns
- * the slot.
- */
-enum class HookPriority {
-    LOW    = 0, ///< Background / optional hooks; can be displaced by MEDIUM or HIGH.
-    MEDIUM = 1, ///< Default priority for most hooks.
-    HIGH   = 2  ///< Critical hooks; cannot be displaced by lower-priority callers.
-};
-
-// ============================================================
-//  HookEntry  (public struct used by HookManager internals,
-//              exposed so consumers can inspect hook state)
-// ============================================================
-
-/**
- * @brief Describes a single registered inline hook.
- */
-struct HookEntry {
-    std::string  name;         ///< Unique name assigned by the caller.
-    void*        targetAddr;   ///< Address of the original function that was hooked.
-    void*        hookFunc;     ///< Address of the replacement function.
-    void**       originalFunc; ///< Points to the trampoline for calling the original.
-    HookPriority priority;     ///< Priority at which this hook was installed.
-    bool         enabled;      ///< Whether the hook is currently active.
-    hook_handle* hookHandle;   ///< Opaque handle returned by the inline-hook engine.
-};
-
-
-// ============================================================
-//  SystemUtils
-// ============================================================
-
-/** Opaque handle type for a loaded shared library. */
-typedef void* LibraryHandle;
-
-/**
- * @brief Thread-safe singleton that manages loading, tracking, and unloading
- *        of native shared libraries (.so files) via dlopen / dlsym / dlclose.
- *
- * Libraries are registered under a caller-supplied string ID so they can be
- * retrieved later by name rather than by raw handle.  The same library is
- * never loaded twice under the same ID.
- *
- * Obtain the instance with getInstance(); release everything with
- * destroyInstance() when the host process is shutting down.
- */
-class SystemUtils {
-public:
-
-    // ----------------------------------------------------------
-    //  LoadFlags – passed as the `flags` parameter to loadLibrary()
-    // ----------------------------------------------------------
-
-    /**
-     * @brief Mirrors the RTLD_* flags from <dlfcn.h> with portable names.
-     *
-     * These values can be OR-combined just like the underlying RTLD constants.
-     */
-    enum LoadFlags {
-        LAZY      = 0x001, ///< Resolve symbols lazily on first use (RTLD_LAZY). Default.
-        NOW       = 0x002, ///< Resolve all symbols immediately on load (RTLD_NOW).
-        GLOBAL    = 0x100, ///< Export the library's symbols into the global namespace (RTLD_GLOBAL).
-        LOCAL     = 0x000, ///< Keep symbols private to this library (RTLD_LOCAL). Default.
-        NODELETE  = 0x200, ///< Prevent unloading even after dlclose (RTLD_NODELETE).
-        NOLOAD    = 0x400, ///< Do not load; only return a handle if already resident (RTLD_NOLOAD).
-        DEEPBIND  = 0x800  ///< Ignore as its not needed in android.
-    };
-
-    // ----------------------------------------------------------
-    //  LibraryInfo – metadata for a registered library
-    // ----------------------------------------------------------
-
-    /**
-     * @brief Snapshot of registration metadata for a single managed library.
-     */
-    struct LibraryInfo {
-        LibraryHandle handle; ///< Raw dlopen handle; nullptr if not currently loaded.
-        std::string   path;   ///< Filesystem path that was passed to loadLibrary().
-        int           flags;  ///< LoadFlags value used when the library was opened.
-        bool          loaded; ///< true if the library is currently resident in memory.
-
-        LibraryInfo();
-        LibraryInfo(LibraryHandle h, const std::string& p, int f);
-    };
-
-    // ----------------------------------------------------------
-    //  Singleton lifecycle
-    // ----------------------------------------------------------
-
-    /**
-     * @brief Returns the process-wide SystemUtils instance, constructing it
-     *        on the first call. Thread-safe.
-     * @return Non-null pointer to the singleton.
-     */
-    static SystemUtils* getInstance();
-
-    /**
-     * @brief Unloads all managed libraries, clears the registry, and destroys
-     *        the singleton instance.
-     *
-     * After this call, the next getInstance() will construct a fresh instance.
-     * Safe to call even if getInstance() was never invoked.
-     */
-    static void destroyInstance();
-
-    // ----------------------------------------------------------
-    //  Library management
-    // ----------------------------------------------------------
-
-    /**
-     * @brief Loads a shared library and registers it under @p libraryId.
-     *
-     * Calls dlopen(@p path, translated(@p flags)). If a library with the same
-     * @p libraryId is already registered the call is a no-op and returns true.
-     *
-     * @param libraryId  Unique string key for later retrieval
-     *                   (e.g. "libfmod", "libminecraft").
-     * @param path       Filesystem path to the .so file (absolute or relative).
-     * @param flags      One or more LoadFlags OR-combined. Defaults to LAZY.
-     * @return true on success; false if dlopen failed – call getLastError() for details.
-     */
-    bool loadLibrary(const std::string& libraryId, const std::string& path, int flags = LAZY);
-
-    /**
-     * @brief Unloads a managed library and removes it from the registry.
-     *
-     * Calls dlclose on the stored handle. Has no effect if @p libraryId is not
-     * found in the registry.
-     *
-     * @param libraryId  Key supplied to loadLibrary().
-     * @return true if the library was found and dlclose succeeded.
-     */
-    bool unloadLibrary(const std::string& libraryId);
-
-    /**
-     * @brief Checks whether a library is currently loaded in the registry.
-     *
-     * @param libraryId  Key supplied to loadLibrary().
-     * @return true if the library is registered and its handle is non-null.
-     */
-    bool isLibraryLoaded(const std::string& libraryId) const;
-
-    /**
-     * @brief Looks up an exported symbol in a specific registered library.
-     *
-     * Equivalent to dlsym(handle_of(libraryId), symbolName).
-     *
-     * @param libraryId   Key of the library to search.
-     * @param symbolName  Mangled or unmangled export name.
-     * @return Symbol address on success; nullptr if the library or symbol was not found.
-     */
-    void* getSymbol(const std::string& libraryId, const std::string& symbolName);
-
-    /**
-     * @brief Searches all registered libraries for a symbol and returns the
-     *        first match.
-     *
-     * Useful when the containing library is not known in advance.
-     *
-     * @param symbolName  Mangled or unmangled export name.
-     * @return Symbol address, or nullptr if not found in any registered library.
-     */
-    void* getSymbolAddress(const std::string& symbolName);
-
-    /**
-     * @brief Returns a copy of the LibraryInfo record for a registered library.
-     *
-     * @param libraryId  Key supplied to loadLibrary().
-     * @return LibraryInfo for the requested library. If the key is not found,
-     *         the returned struct has loaded == false and a null handle.
-     */
-    LibraryInfo getLibraryInfo(const std::string& libraryId) const;
-
-    /**
-     * @brief Returns the IDs of all currently registered libraries.
-     *
-     * @return Vector of libraryId strings in no guaranteed order.
-     */
-    std::vector<std::string> getLoadedLibraries() const;
-
-    // ----------------------------------------------------------
-    //  Raw dl* wrappers  (static – no registry involvement)
-    // ----------------------------------------------------------
-
-    /**
-     * @brief Thin static wrapper around ::dlopen.
-     *
-     * Unlike loadLibrary(), the returned handle is NOT tracked in the registry.
-     * Use when you need a short-lived, unregistered handle.
-     *
-     * @param path   Path to the shared library.
-     * @param flags  dlopen flags (RTLD_* or LoadFlags values).
-     * @return Opaque library handle, or nullptr on failure.
-     */
-    static void* dlOpen(const std::string& path, int flags);
-
-    /**
-     * @brief Thin static wrapper around ::dlsym.
-     *
-     * @param handle  Handle obtained from dlOpen() or any dlopen-compatible source.
-     * @param symbol  Symbol name to resolve.
-     * @return Symbol address, or nullptr if not found.
-     */
-    static void* dlSym(void* handle, const std::string& symbol);
-
-    /**
-     * @brief Thin static wrapper around ::dlclose.
-     *
-     * @param handle  Handle to close.
-     * @return true on success; false if ::dlclose returned an error.
-     */
-    static bool dlClose(void* handle);
-
-    /**
-     * @brief Returns and clears the last error string from the dl* subsystem.
-     *
-     * Equivalent to ::dlerror(). Call immediately after a failed dlOpen / dlSym
-     * / dlClose to retrieve the human-readable message.
-     *
-     * @return Error string, or an empty string if there is no pending error.
-     */
-    static std::string dlError();
-
-    // ----------------------------------------------------------
-    //  Error helpers
-    // ----------------------------------------------------------
-
-    /**
-     * @brief Returns the last error string recorded by any SystemUtils operation.
-     * @return Human-readable error description, or an empty string if no error.
-     */
-    std::string getLastError() const;
-
-    /**
-     * @brief Clears the stored last-error string.
-     */
-    void clearError();
-
-private:
-    SystemUtils();
-    ~SystemUtils();
-    SystemUtils(const SystemUtils&)            = delete;
-    SystemUtils& operator=(const SystemUtils&) = delete;
-};
-
-
-// ============================================================
-//  HookManager
-// ============================================================
-
-/**
- * @brief Singleton that provides inline function hooking, NOP patching,
- *        memory read/write, signature scanning, and process-map inspection.
- *
- * All public methods are guarded by an internal mutex and are safe to call
- * from any thread after initialize() returns true.
- *
- * Typical usage:
- * @code
- *   auto& hm = HookManager::getInstance();
- *   hm.initialize();
- *
- *   void* origFn = nullptr;
- *   hm.hookAddr("my_hook", targetAddr, (void*)myHook,
- *               &origFn, 0, HookPriority::MEDIUM);
- *   // ... later ...
- *   hm.unhookAddr("my_hook");
- *   hm.cleanup();
- * @endcode
- */
 class HookManager {
 public:
 
-    // ----------------------------------------------------------
-    //  Singleton lifecycle
-    // ----------------------------------------------------------
-
-    /**
-     * @brief Returns the process-wide HookManager instance.
-     * @return Reference to the singleton.
-     */
-    static HookManager& getInstance();
-
-    /**
-     * @brief One-time initialisation: sets up the inline-hook engine, resolves
-     *        the Minecraft base address, and loads the hook blacklist.
-     * @return true if all subsystems initialised successfully.
-     */
-    bool initialize();
-
-    /**
-     * @brief Removes every active hook and NOP patch, then frees internal
-     *        resources.
-     *
-     * Call this before the host process exits to avoid dangling trampolines.
-     */
-    void cleanup();
-
-    /**
-     * @brief undocumented; does nothing in Release builds.
-     */
-    void debugStatus();
-
-    // ----------------------------------------------------------
-    //  Core hook API
-    // ----------------------------------------------------------
 
     /**
      * @brief Resolves and caches the load address of libminecraft.so.
@@ -369,301 +54,7 @@ public:
      */
     bool getMinecraftBaseAddress();
 
-    /**
-     * @brief Installs an inline hook at @p targetAddr, redirecting execution
-     *        to @p hookFunc.
-     *
-     * A trampoline is generated so the original function can still be called
-     * through *@p originalFunc. The hook is registered under @p name so it
-     * can be removed later with unhookAddr().
-     *
-     * The call is rejected (returns 0) if:
-     *  - @p name or @p targetAddr is blacklisted.
-     *  - A higher-priority hook already owns the slot.
-     *
-     * @param name          Unique identifier for this hook.
-     * @param targetAddr    Address of the function to hook.
-     * @param hookFunc      Your replacement function – must exactly match the
-     *                      target's calling convention and parameter types.
-     * @param originalFunc  Out-param written with the trampoline address so you
-     *                      can call the original. Pass nullptr if not needed.
-     * @param hookType      Hook type constant; pass 0 for the default
-     *                      inline hook.
-     * @param priority      Priority level. Defaults to HookPriority::MEDIUM.
-     * @return Trampoline address on success; 0 on failure.
-     */
-    uintptr_t hookAddr(const std::string& name,
-                       void*              targetAddr,
-                       void*              hookFunc,
-                       void**             originalFunc,
-                       int                hookType,
-                       HookPriority       priority = HookPriority::MEDIUM);
 
-    /**
-     * @brief Removes a hook installed by hookAddr() and restores the original
-     *        bytes at the target address.
-     *
-     * @param name  The name string passed to hookAddr().
-     * @return true if the hook was found and successfully removed.
-     */
-    bool unhookAddr(const std::string& name);
-
-    /**
-     * @brief Overwrites @p size bytes at @p addr with NOP instructions,
-     *        saving the original bytes for later restoration.
-     *
-     * Handles page-permission changes automatically. The patch is registered
-     * under @p name.
-     *
-     * @param name  Unique identifier for this patch (used with restoreNopPatch).
-     * @param addr  Start address of the region to NOP out.
-     * @param size  Number of bytes to overwrite with NOPs.
-     * @return true if the memory was patched successfully.
-     */
-    bool patchNop(const std::string& name, void* addr, size_t size);
-
-    /**
-     * @brief Restores the bytes that were overwritten by patchNop().
-     *
-     * @param name  The name string passed to patchNop().
-     * @return true if the patch was found and the original bytes were restored.
-     */
-    bool restoreNopPatch(const std::string& name);
-
-
-
-    // ----------------------------------------------------------
-    //  Priority management
-    // ----------------------------------------------------------
-
-    /**
-     * @brief Tests whether a new hook with the given priority may claim the
-     *        slot identified by @p name.
-     *
-     * A slot can be claimed if it is free, or if the requesting priority is
-     * strictly higher than the existing owner's priority.
-     *
-     * @param name      Hook name (slot identifier).
-     * @param priority  Priority of the incoming hook attempt.
-     * @return true if the hook is permitted to proceed.
-     */
-    bool canHookWithPriority(const std::string& name, HookPriority priority);
-
-    /**
-     * @brief Releases the priority claim on a slot without removing the hook.
-     *
-     * After this call a lower-priority hook may reclaim the same slot.
-     *
-     * @param name  Hook name whose priority claim should be relinquished.
-     */
-    void releasePriority(const std::string& name);
-
-
-    // ----------------------------------------------------------
-    //  Memory utilities
-    // ----------------------------------------------------------
-
-    /**
-     * @brief Writes @p len bytes from @p src to @p dest, temporarily remapping
-     *        the destination page as writable if necessary.
-     *
-     * Safe to use on read-only or execute-only pages.
-     *
-     * @param dest  Destination address.
-     * @param src   Source buffer.
-     * @param len   Number of bytes to write.
-     * @return true on success.
-     */
-    bool writeMemory(void* dest, void* src, size_t len);
-
-    /**
-     * @brief Reads @p len bytes from @p src into @p dest, remapping the source
-     *        page as readable if necessary.
-     *
-     * Safe to use on execute-only pages.
-     *
-     * @param dest  Destination buffer.
-     * @param src   Source address to read from.
-     * @param len   Number of bytes to read.
-     * @return true on success.
-     */
-    bool readMemory(void* dest, void* src, size_t len);
-
-    /**
-     * @brief Resolves a multi-level pointer chain.
-     *
-     * Starting from @p baseAddr, applies each element of @p offsets in turn,
-     * dereferencing the resulting pointer at each step.
-     *
-     * Example – three-level pointer:
-     * @code
-     *   uintptr_t offs[] = { 0x10, 0x28, 0x08 };
-     *   uintptr_t result = hm.getAddress(mclib_baseaddr, offs, 3);
-     * @endcode
-     *
-     * @param baseAddr     Starting absolute address (e.g. mclib_baseaddr + offset).
-     * @param offsets      Array of byte offsets applied at each dereference step.
-     * @param totalOffset  Number of elements in @p offsets.
-     * @return Final resolved address; 0 if any intermediate dereference is null.
-     */
-    uintptr_t getAddress(uintptr_t baseAddr, uintptr_t offsets[], int totalOffset);
-
-    /**
-     * @brief Allocates an anonymous executable memory region as close as
-     *        possible to @p hint – intended for near-trampolines.
-     *
-     * Stays within ±2 GB of @p hint so that relative 26-bit branches (B/BL on
-     * AArch64, E9 JMP on x86-64) can reach the allocated stub.
-     *
-     * @param hint  Address the allocation should be near.
-     * @param size  Number of bytes to allocate.
-     * @param prot  mmap protection flags (e.g. PROT_READ | PROT_EXEC).
-     * @return Pointer to the allocated region; nullptr on failure.
-     */
-    void* mmapNear(void* hint, size_t size, int prot);
-
-    /**
-     * @brief Finds the base address of a named module mapping from
-     *        /proc/self/maps, optionally filtered by permission string.
-     *
-     * @param moduleName   Substring matched against the mapping pathname
-     *                     (e.g. "libminecraft.so").
-     * @param permissions  Optional permission string to match (e.g. "r-xp").
-     *                     Pass "" (default) to accept any permissions.
-     * @return Base address of the first matching mapping; nullptr if not found.
-     */
-    void* getModuleAddr(const std::string& moduleName,
-                        const std::string& permissions = "");
-
-    /**
-     * @brief Returns the current mmap protection flags for the page containing
-     *        @p addr.
-     *
-     * Parsed from /proc/self/maps.
-     *
-     * @param addr  Any address inside the page of interest.
-     * @return PROT_* bitmask (e.g. PROT_READ | PROT_EXEC); -1 if not mapped.
-     */
-    int getProtection(uintptr_t addr);
-
-    /**
-     * @brief Finds an unmapped virtual-address region near @p target that is
-     *        at least @p size bytes in length.
-     *
-     * Used internally by mmapNear() to locate a suitable free slot.
-     *
-     * @param target  Address the result should be as close to as possible.
-     * @param size    Minimum required size of the free region in bytes.
-     * @return Start address of a suitable unmapped region; nullptr if none found.
-     */
-    void* findUnmapped(void* target, size_t size);
-
-    // ----------------------------------------------------------
-    //  Signature scanning
-    // ----------------------------------------------------------
-
-    /**
-     * @brief Sets up a signature scan using a human-readable IDA-style pattern.
-     *
-     * Pattern format: space-separated hex bytes with "??" as wildcards.
-     * Example: "48 8B 05 ?? ?? ?? ?? 48 85 C0 74 0A"
-     *
-     * The scan searches the memory region(s) mapped for @p libName. Call
-     * getSigScanResult() to execute the scan and retrieve the result, then
-     * sigScanCleanup() to free the handle regardless of outcome.
-     *
-     * @param signature  IDA-style pattern string.
-     * @param libName    Library whose mapped region to search (e.g. "libminecraft.so").
-     * @param flags      gamepwange specific scan flags (0 for defaults).
-     * @return Opaque sigscan_handle on success; nullptr if setup failed.
-     */
-    sigscan_handle* sigScanSetup(const std::string& signature,
-                                 const std::string& libName,
-                                 int                flags);
-
-    /**
-     * @brief Sets up a signature scan using raw byte arrays instead of a
-     *        pattern string.
-     *
-     * @param sigByte  Pattern byte array to search for.
-     * @param mask     Mask array of the same length as @p sigByte.
-     *                 0xFF = byte must match exactly; 0x00 = wildcard (skip).
-     * @param sigSize  Length of both @p sigByte and @p mask in bytes.
-     * @param libName  Library whose mapped region to search.
-     * @param flags    Engine-specific scan flags (0 for defaults).
-     * @return Opaque sigscan_handle on success; nullptr if setup failed.
-     */
-    sigscan_handle* sigScanSetupRaw(uint8_t*           sigByte,
-                                    uint8_t*           mask,
-                                    size_t             sigSize,
-                                    const std::string& libName,
-                                    int                flags);
-
-    /**
-     * @brief Frees all resources associated with a scan handle.
-     *
-     * Must be called after getSigScanResult() to avoid memory leaks, regardless
-     * of whether a match was found.
-     *
-     * @param handle  Handle returned by sigScanSetup() or sigScanSetupRaw().
-     */
-    void sigScanCleanup(sigscan_handle* handle);
-
-    /**
-     * @brief Executes the prepared scan and returns the address of the first match.
-     *
-     * Blocks the calling thread until the scan completes. Call sigScanCleanup()
-     * afterwards to free the handle.
-     *
-     * @param handle  Handle returned by sigScanSetup() or sigScanSetupRaw().
-     * @return Address of the first matching byte sequence; nullptr if not found.
-     */
-    void* getSigScanResult(sigscan_handle* handle);
-
-    // ----------------------------------------------------------
-    //  ARM64 hook helper
-    // ----------------------------------------------------------
-
-    /**
-     * UNDOCUMETED Read GamePwange Docs
-     */
-    uintptr_t armHook64(uintptr_t addr, uintptr_t branchAddr, size_t len);
-
-    // ----------------------------------------------------------
-    //  Process map inspection
-    // ----------------------------------------------------------
-
-    /**
-     * @brief Parses /proc/self/maps and returns all entries whose pathname
-     *        contains @p module.
-     *
-     * The returned array is heap-allocated. The caller must delete[] it when
-     * done. @p mapCount is set to the number of entries.
-     *
-     * @param module    Substring matched against mapping pathnames
-     *                  (e.g. "libminecraft.so").
-     * @param mapCount  Out-param; set to the number of proc_map entries returned.
-     * @return Heap-allocated array of proc_map structs; nullptr on error or if
-     *         no entries match. Caller is responsible for delete[].
-     */
-    proc_map* getProcMap(const std::string& module, unsigned int& mapCount);
-
-    /**
-     * @brief Returns the number of /proc/self/maps entries whose pathname
-     *        contains @p module, without allocating the full array.
-     *
-     * Cheaper than getProcMap() when only the count is needed.
-     *
-     * @param module  Substring matched against mapping pathnames.
-     * @return Number of matching entries.
-     */
-    unsigned int getProcMapCount(const std::string& module);
-
-private:
-    HookManager()  = default;
-    ~HookManager() = default;
-    HookManager(const HookManager&)            = delete;
-    HookManager& operator=(const HookManager&) = delete;
 };
 
 
@@ -1122,6 +513,52 @@ void* GetGLContextPointer();
 float GetCurrentFPS();
 
 /**
+ * @brief Function signature for render callbacks.
+ *
+ * Called once per frame from the engine's render thread, inside the active
+ * OpenGL ES context (during eglSwapBuffers).
+ *
+ * This is the correct place to issue rendering commands such as ImGui draw calls
+ * or custom OpenGL rendering. The GL context is guaranteed to be current.
+ *
+ * @note Do not perform heavy blocking operations inside this callback.
+ */
+typedef void (*RenderCallback)();
+
+
+namespace RenderAPI {
+
+    /**
+     * @brief Registers a render callback.
+     *
+     * The callback will be invoked every frame during the rendering phase,
+     * after the game has finished its draw calls but before buffers are swapped.
+     *
+     * Multiple callbacks may be registered and will be executed in registration order.
+     *
+     * @param cb Function pointer to a render callback.
+     *
+     * @note The callback must remain valid for the duration of its registration.
+     * @note Duplicate registrations are ignored or may result in multiple calls
+     *       depending on implementation.
+     */
+    void Register(RenderCallback cb);
+
+
+    /**
+     * @brief Unregisters a previously registered render callback.
+     *
+     * Removes the callback from the render pipeline so it will no longer be invoked.
+     *
+     * @param cb Function pointer previously passed to Register().
+     *
+     * @note Safe to call even if the callback is not currently registered.
+     */
+    void Unregister(RenderCallback cb);
+
+}
+
+/**
  * @brief Emits a log message through the Apps client logger.
  *
  *
@@ -1133,3 +570,160 @@ float GetCurrentFPS();
  * @param message     Null-terminated UTF-8 message string to emit.
  */
 extern "C" void ClientLog(const char* threadName, const char* tag, const char* message);
+
+
+
+#pragma once
+
+/**
+ * @brief Represents a single touch input event.
+ *
+ * Encapsulates data from the Android input system. Coordinates are provided
+ * in screen space (pixels), matching the current surface resolution.
+ */
+struct TouchEvent {
+
+    /**
+     * @brief Action type of the touch event.
+     *
+     * Common values:
+     * - 0 → ACTION_DOWN
+     * - 1 → ACTION_UP
+     * - 2 → ACTION_MOVE
+     * - 5 → ACTION_POINTER_DOWN
+     * - 6 → ACTION_POINTER_UP
+     */
+    int action;
+
+    /**
+     * @brief Pointer identifier for Multi touch input.
+     *
+     * Each active finger is assigned a unique pointerId. This allows tracking
+     * multiple simultaneous touches.
+     */
+    int pointerId;
+
+    /**
+     * @brief X coordinate of the touch event (in pixels).
+     */
+    float x;
+
+    /**
+     * @brief Y coordinate of the touch event (in pixels).
+     */
+    float y;
+};
+
+
+/**
+ * @brief Function signature for touch callbacks.
+ *
+ * Called whenever a touch event is received from the input system.
+ *
+ * @param ev Pointer to the current touch event.
+ * @return true if the event is consumed and should NOT be passed to the game,
+ *         false to allow the game to process it normally.
+ *
+ * @note Returning true will block the event from reaching the underlying game.
+ */
+typedef bool (*TouchCallback)(const TouchEvent* ev);
+
+
+namespace TouchAPI {
+
+    /**
+     * @brief Registers a touch callback.
+     *
+     * The callback will be invoked for every incoming touch event.
+     * Callbacks are executed in registration order.
+     *
+     * @param cb Function pointer to a touch callback.
+     *
+     * @note The callback must remain valid for the duration of its registration.
+     */
+    void RegisterCallback(TouchCallback cb);
+
+
+    /**
+     * @brief Unregisters a previously registered touch callback.
+     *
+     * Removes the callback from the input pipeline.
+     *
+     * @param cb Function pointer previously passed to RegisterCallback().
+     *
+     * @note Safe to call even if the callback is not currently registered.
+     */
+    void UnregisterCallback(TouchCallback cb);
+
+}
+
+#pragma once
+
+// ============================================================
+// Ambient SDK - Key Input API
+// ============================================================
+//
+// Provides access to keyboard / button input from the engine.
+// Supports interception and consumption of key events.
+//
+// ============================================================
+
+
+/**
+ * @brief Function signature for key input callbacks.
+ *
+ * Called whenever a key event is received from the Android input system.
+ *
+ * @param keyCode Android key code (e.g. KEYCODE_A, KEYCODE_BACK, etc.)
+ * @param action  Key action:
+ *                - 0 → ACTION_DOWN
+ *                - 1 → ACTION_UP
+ *                - 2 → ACTION_MULTIPLE
+ * @param unicodeChar Unicode character produced by the key event (if applicable),
+ *                    or 0 if the key does not produce a character.
+ *
+ * @return true if the event is consumed and should NOT be passed to the game,
+ *         false to allow the game to process the event normally.
+ *
+ * @note Returning true blocks the event from reaching the underlying game.
+ * @note This callback is executed on the input (JNI) thread.
+ * @note Keep handlers lightweight to avoid input lag.
+ */
+typedef bool (*KeyHandler)(int keyCode, int action, int unicodeChar);
+
+
+
+
+namespace KeyAPI {
+
+    /**
+     * @brief Registers a key input handler.
+     *
+     * The handler will be invoked for every key event dispatched
+     * through the engine's input system.
+     *
+     * Handlers are executed in registration order.
+     * Dispatch stops early if a handler returns true (event consumed).
+     *
+     * @param handler Function pointer to a key handler.
+     *
+     * @note The handler must remain valid for the duration of its registration.
+     * @note Duplicate registrations are ignored.
+     */
+    void RegisterHandler(KeyHandler handler);
+
+
+    /**
+     * @brief Unregisters a previously registered key input handler.
+     *
+     * Removes the handler from the input pipeline so it will no longer receive events.
+     *
+     * @param handler Function pointer previously passed to RegisterHandler().
+     *
+     * @note Safe to call even if the handler is not currently registered.
+     */
+    void UnregisterHandler(KeyHandler handler);
+
+}
+
+
