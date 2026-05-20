@@ -1,27 +1,14 @@
 #pragma once
 
 
-// ============================================================
-//  library includes
-// ============================================================
 #include <cstdint>
 #include <cstddef>
 #include <string>
 #include <vector>
 #include <functional>
 
-extern "C" {
-#include "mem.h"        // writeMemory / readMemory primitives
-#include "proc.h"       // proc_map type and /proc/self/maps helpers
-#include "nop.h"        // NOP-patch utilities
-#include "armhook.h"    // ARM/ARM64 branch-hook primitives
-#include "inlinehook.h" // hook_handle type and inline-hook 
-#include "memscan.h"    // sigscan_handle type and signature-scan 
-}
 
-// ============================================================
-//  FMOD forward declarations
-// ============================================================
+
 namespace FMOD {
     class System;
     class Sound;
@@ -31,36 +18,7 @@ namespace FMOD {
 }
 struct FMOD_CREATESOUNDEXINFO;
 
-// ============================================================
-//  Globally accessible Minecraft library base address
-//  Resolved by HookManager::getMinecraftBaseAddress().
-// ============================================================
-extern uintptr_t mclib_baseaddr;
 
-
-class HookManager {
-public:
-
-
-    /**
-     * @brief Resolves and caches the load address of libminecraft.so.
-     *
-     * Called automatically by initialize(). Exposed publicly so the address
-     * can be re-queried if the library is reloaded.
-     *
-     * Sets the global ::mclib_baseaddr on success.
-     *
-     * @return true if libminecraft.so was found in /proc/self/maps.
-     */
-    bool getMinecraftBaseAddress();
-
-
-};
-
-
-// ============================================================
-//  FMODHook
-// ============================================================
 
 /**
  * @brief Hooks into the FMOD Core library loaded by Minecraft to intercept
@@ -556,6 +514,39 @@ namespace RenderAPI {
      */
     void Unregister(RenderCallback cb);
 
+
+    /**
+     * @brief Registers a render callback beneath the game's UI layer.
+     *
+     * The callback will be invoked every frame during rendering,
+     * before the game's UI and overlay elements are drawn.
+     *
+     * This is useful for rendering background visuals, world-space overlays,
+     * or effects that should appear underneath menus and HUD components.
+     *
+     * Multiple callbacks may be registered and will execute in registration order.
+     *
+     * @param cb Function pointer to a render callback.
+     *
+     * @note The callback must remain valid for the duration of its registration.
+     * @note Duplicate registrations are ignored or may result in multiple calls
+     *       depending on implementation.
+     */
+    void RegisterUnderUI(RenderCallback cb);
+
+
+    /**
+     * @brief Unregisters a previously registered under-UI render callback.
+     *
+     * Removes the callback from the under-UI render pipeline
+     * so it will no longer be invoked.
+     *
+     * @param cb Function pointer previously passed to RegisterUnderUI().
+     *
+     * @note Safe to call even if the callback is not currently registered.
+     */
+    void UnregisterUnderUI(RenderCallback cb);
+
 }
 
 /**
@@ -654,6 +645,8 @@ namespace TouchAPI {
      * @note Safe to call even if the callback is not currently registered.
      */
     void UnregisterCallback(TouchCallback cb);
+
+
 
 }
 
